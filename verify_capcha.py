@@ -4,15 +4,30 @@ from selenium.webdriver.support.wait import WebDriverWait
 from selenium.webdriver.common.by import By
 from selenium.webdriver import ActionChains
 from selenium import webdriver
+import numpy as np
 import cv2 as cv
+import platform
 import requests
 import random
 import time
+import os
 
+def get_driver():
+    os_type = platform.system()
+    root_dir = os.path.dirname(os.path.abspath(__file__))
+    drivers_dir = os.path.join(root_dir, 'drivers')
+    if os_type == 'Darwin':
+        return os.path.join(drivers_dir, 'chromedriver_mac64')
+    elif os_type == 'Windows':
+        return os.path.join(drivers_dir, 'chromedriver_win32.exe')
+    elif os_type == 'Linux':
+        return os.path.join(drivers_dir, 'chromedriver_linux64')
+    else:
+        return None
 
 class Tencent:
     """
-    识别腾讯验证码
+    识别tx验证码
     """
 
     def __init__(self, url, username, password):
@@ -25,11 +40,16 @@ class Tencent:
         """
         profile = webdriver.ChromeOptions()  # 配置无头
         profile.add_argument('-headless')
-        self.browser = webdriver.Chrome()
+        driver_location = get_driver()
+        if driver_location is None:
+            print('不支持的系统类型！')
+            exit(-1)
+        self.browser = webdriver.Chrome(driver_location)
         self.wait = WebDriverWait(self.browser, 20)
         self.url = url  # 目标url
         self.username = username  # 用户名
         self.password = password  # 密码
+        self.retry_count = 0 # 重试次数
 
     def end(self):
         """
@@ -55,23 +75,27 @@ class Tencent:
         self.set_info()
         try:
             WebDriverWait(self.browser, 20, 0.5).until(
-                EC.presence_of_element_located((By.ID, 'tcaptcha_iframe')))  # 等待 iframe
+                EC.presence_of_element_located((By.ID, 'tcaptcha_iframe_dy')))  # 等待 iframe
         except:
-            print("load  tcaptcha_iframe failed")
+            print("load  tcaptcha_iframe_dy failed")
             return False
         self.browser.switch_to.frame(
-            self.browser.find_element_by_id('tcaptcha_iframe'))  # 加载 iframe
+            self.browser.find_element_by_id('tcaptcha_iframe_dy'))  # 加载 iframe
         time.sleep(0.5)
-        bk_block = self.browser.find_element_by_xpath(
-            '//img[@id="slideBg"]').get_attribute('src')
-        print(bk_block)
-        if self.save_img(bk_block):
-            dex = self.get_pos()
+        # 捡取验证图
+        slide_bg = self.browser.find_element_by_xpath(
+            '//div[@id="slideBg"]').value_of_css_property('background-image').lstrip('url("').rstrip('")')
+        # 捡取滑块
+        slide_block = self.browser.find_element_by_xpath(
+            '//div[@class="tc-fg-item" and contains(@style,"cap_union_new_getcapbysig?img_index=0")]').value_of_css_property('background-image').lstrip('url("').rstrip('")')
+        # 保存验证图+滑块
+        if self.save_img(slide_bg, 'bg') and self.save_img(slide_block, 'block'):
+            dex = self.get_pos() # 获取滑动距离
             if dex:
-                track_list = self.get_track(dex)
+                track_list = self.get_track(dex) # 获取滑动路径
                 time.sleep(0.5)
                 slid_ing = self.browser.find_element_by_xpath(
-                    '//div[@id="tcaptcha_drag_thumb"]')  # 滑块定位
+                    '//img[@class="tc-slider-bg unselectable"]')  # 滑块定位
                 ActionChains(self.browser).click_and_hold(
                     on_element=slid_ing).perform()  # 鼠标按下
                 time.sleep(0.2)
@@ -82,9 +106,15 @@ class Tencent:
                 time.sleep(1)
                 ActionChains(self.browser).release(
                     on_element=slid_ing).perform()  # print('第三步,释放鼠标')
-                time.sleep(1)
-                # 识别图片
-                return True
+                time.sleep(10)
+                # 判断是否验证成功
+                try:
+                    if (self.browser.find_element_by_xpath('//a[@class="btn-sign-in"]')):
+                        return True
+                except:
+                    self.re_start()
+                else:
+                    self.re_start()
             else:
                 self.re_start()
         else:
@@ -92,16 +122,18 @@ class Tencent:
             return False
 
     @staticmethod
-    def save_img(bk_block):
+    def save_img(img_url, type):
         """
         保存图片
 
-        :param bk_block: 图片url
+        :param img_url: 图片url
+        :param type: 类型
         :return: bool类型，是否被保存
         """
         try:
-            img = requests.get(bk_block).content
-            with open('bg.jpeg', 'wb') as f:
+            img = requests.get(img_url).content
+            file_name = type + '.jpeg'
+            with open(file_name, 'wb') as f:
                 f.write(img)
             return True
         except:
@@ -112,31 +144,33 @@ class Tencent:
         """识别缺口
         注意：网页上显示的图片为缩放图片，缩放 50% 所以识别坐标需要 0.5
         """
-        image = cv.imread('bg.jpeg')
-        blurred = cv.GaussianBlur(image, (5, 5), 0)
-        canny = cv.Canny(blurred, 200, 400)
-        contours, hierarchy = cv.findContours(canny, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-        for i, contour in enumerate(contours):
-            m = cv.moments(contour)
-            if m['m00'] == 0:
-                cx = cy = 0
-            else:
-                cx, cy = m['m10'] / m['m00'], m['m01'] / m['m00']
-            if 6000 < cv.contourArea(contour) < 8000 and 370 < cv.arcLength(contour, True) < 390:
-                if cx < 400:
-                    continue
-                x, y, w, h = cv.boundingRect(contour)  # 外接矩形
-                cv.rectangle(image, (x, y), (x + w, y + h), (0, 0, 255), 2)
-                # cv.imshow('image', image)  # 显示识别结果
-                print('【缺口识别】 {x}px'.format(x=x/2))
-                return x/2
-        return 0
+        background_pic = cv.imread('bg.jpeg', 0) # 保存验证图
+        slider_pic = cv.imread('block.jpeg', 0) # 保存滑块
+        slider_pic = slider_pic[500:500+120, 140:140+120] # 下发的滑块是个组合图，需要把缺口图片裁剪出来
+        width, height = slider_pic.shape[::-1] # 滑块宽高
+        background_pic = cv.GaussianBlur(background_pic, (5, 5), 0)
+        slider_pic = cv.GaussianBlur(slider_pic, (5, 5), 0)
+        background_pic = cv.Canny(background_pic, 200, 400)
+        slider_pic = cv.Canny(slider_pic, 200, 400)
+        result = cv.matchTemplate(background_pic, slider_pic, cv.TM_CCORR_NORMED) # 相似计算
+        min_val, max_val, min_loc, max_loc = cv.minMaxLoc(result)
+        # 画出识别区域 调试用
+        # br = (max_loc[0] + width, max_loc[1] + height)
+        # cv.rectangle(background_pic, max_loc, br, [255, 255, 255])
+        # cv.imshow('image', background_pic)
+        # cv.waitKey()
+        # 获取图片的缺口位置
+        top, left = np.unravel_index(result.argmax(), result.shape)
+        # 下发图片为端展图片的两倍，故这里日志和距离返回值都需要除以2
+        print("当前滑块的缺口位置：", (left, top, left + width / 2, top + height / 2))
+        print("滑动距离：", max_loc[0])
+        return max_loc[0] / 2
 
     @staticmethod
     def get_track(distance):
         """模拟轨迹
         """
-        distance -= 37  # 初始位置
+        distance -= 25  # 扣除初始位置
         # 初速度
         v = 0
         # 单位时间为0.2s来统计轨迹，轨迹即0.2内的位移
@@ -148,14 +182,14 @@ class Tencent:
         # 到达mid值开始减速
         mid = distance * 7 / 8
 
-        distance += 10  # 先滑过一点，最后再反着滑动回来
+        # distance += 10  # 先滑过一点，最后再反着滑动回来
         # a = random.randint(1,3)
         while current < distance:
             if current < mid:
                 # 加速度越小，单位时间的位移越小,模拟的轨迹就越多越详细
                 a = random.randint(2, 4)  # 加速运动
             else:
-                a = -random.randint(3, 5)  # 减速运动
+                a = -random.randint(1, 3)  # 减速运动
 
             # 初速度
             v0 = v
@@ -169,11 +203,11 @@ class Tencent:
             # 速度已经达到v,该速度作为下次的初速度
             v = v0 + a * t
 
-        # 反着滑动到大概准确位置
-        for i in range(4):
-            tracks.append(-random.randint(2, 3))
-        for i in range(4):
-            tracks.append(-random.randint(1, 3))
+        # # 反着滑动到大概准确位置
+        # for i in range(4):
+        #     tracks.append(-random.randint(2, 3))
+        # for i in range(4):
+        #     tracks.append(-random.randint(1, 3))
         return tracks
 
     def move_to(self, index):
@@ -191,6 +225,8 @@ class Tencent:
 
         :return: None
         """
-        self.tx_code()
+        if (self.retry_count <= 5):
+            self.retry_count += 1
+            self.tx_code()
 
         self.end()
